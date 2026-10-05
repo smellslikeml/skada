@@ -39,6 +39,7 @@ DAEstimators with adapters (Pipeline):
       NearestNeighborReweight
       MMDTarSReweight
       KMMReweight
+      uLSIFReweight
 
 Adapters:
    .. autosummary::
@@ -52,6 +53,7 @@ Adapters:
       NearestNeighborReweightAdapter
       MMDTarSReweightAdapter
       KMMReweightAdapter
+      uLSIFReweightAdapter
 
 
 Sample mapping and alignment DA methods
