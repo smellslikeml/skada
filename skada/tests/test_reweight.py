@@ -7,6 +7,7 @@
 
 import numpy as np
 import pytest
+from scipy.stats import spearmanr
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils import check_random_state
@@ -27,6 +28,8 @@ from skada import (
     NearestNeighborReweight,
     NearestNeighborReweightAdapter,
     make_da_pipeline,
+    uLSIFReweight,
+    uLSIFReweightAdapter,
 )
 from skada.base import (
     BaseAdapter,
@@ -86,6 +89,12 @@ from skada.utils import source_target_split
         KMMReweight(solver="frank-wolfe"),
         KMMReweight(solver="scipy"),
         make_da_pipeline(
+            uLSIFReweightAdapter(random_state=42),
+            LogisticRegression().set_fit_request(sample_weight=True),
+        ),
+        uLSIFReweight(random_state=42),
+        uLSIFReweight(gamma=1.0, reg=0.1, random_state=42),
+        make_da_pipeline(
             MMDTarSReweightAdapter(gamma=1.0),
             LogisticRegression().set_fit_request(sample_weight=True),
         ),
@@ -136,6 +145,11 @@ def test_reweight_estimator(estimator, da_dataset):
         ),
         KMMReweight(Ridge().set_fit_request(sample_weight=True)),
         KMMReweight(Ridge().set_fit_request(sample_weight=True), eps=0.1),
+        make_da_pipeline(
+            uLSIFReweightAdapter(random_state=42),
+            Ridge().set_fit_request(sample_weight=True),
+        ),
+        uLSIFReweight(Ridge().set_fit_request(sample_weight=True), random_state=42),
         make_da_pipeline(
             MMDTarSReweightAdapter(gamma=1.0),
             Ridge().set_fit_request(sample_weight=True),
@@ -219,6 +233,8 @@ def _base_test_new_X_adapt(estimator, da_dataset):
         (KLIEPReweightAdapter(gamma=[0.1, 1, "auto", "scale"], random_state=42)),
         (KMMReweightAdapter(gamma=0.1, smooth_weights=True)),
         (KMMReweightAdapter(gamma=0.1, smooth_weights=True)),
+        (uLSIFReweightAdapter(random_state=42)),
+        (uLSIFReweightAdapter(random_state=42)),
         (MMDTarSReweightAdapter(gamma=1.0)),
         (MMDTarSReweightAdapter(gamma=1.0)),
     ],
@@ -236,6 +252,7 @@ def test_new_X_adapt(estimator, da_reg_datasets):
         DiscriminatorReweightAdapter(),
         KLIEPReweightAdapter(gamma=[0.1, 1, "auto", "scale"], random_state=42),
         KMMReweightAdapter(gamma=0.1, smooth_weights=True),
+        uLSIFReweightAdapter(random_state=42),
         MMDTarSReweightAdapter(gamma=1.0),
     ],
 )
@@ -259,6 +276,102 @@ def test_reweight_warning(da_dataset):
 def test_KMMReweight_kernel_error():
     with pytest.raises(ValueError, match="got 'hello'"):
         KMMReweightAdapter(kernel="hello")
+
+
+def test_uLSIFReweight_reg_error(da_dataset):
+    X_train, y_train, sample_domain = da_dataset.pack(
+        as_sources=["s"], as_targets=["t"], mask_target_labels=True
+    )
+    estimator = uLSIFReweightAdapter(gamma=1.0, reg=-1)
+    with pytest.raises(ValueError, match="`reg` argument should be positive"):
+        estimator.fit(X_train, y_train, sample_domain=sample_domain)
+
+
+def test_uLSIFReweight_weights_match_true_ratio():
+    rng = check_random_state(42)
+    n_samples = 1000
+    # source and target are Gaussians with the same covariance and shifted
+    # means, so the true importance w(x) = p_target(x) / p_source(x) is known
+    mean_source = np.zeros(2)
+    mean_target = np.array([1.0, 0.0])
+    cov = np.eye(2)
+    X_source = rng.multivariate_normal(mean_source, cov, n_samples)
+    X_target = rng.multivariate_normal(mean_target, cov, n_samples)
+
+    true_ratio = np.exp(
+        X_source @ (mean_target - mean_source)
+        - 0.5 * (mean_target @ mean_target - mean_source @ mean_source)
+    )
+
+    X = np.concatenate([X_source, X_target])
+    sample_domain = np.concatenate([np.ones(n_samples), -np.ones(n_samples)])
+
+    estimator = uLSIFReweightAdapter(random_state=0)
+    estimator.fit(X, sample_domain=sample_domain)
+    weights = estimator.compute_weights(X, sample_domain=sample_domain)
+    source_weights = weights[:n_samples]
+
+    # the estimated weights are non-negative
+    assert np.all(source_weights >= 0)
+    # and they follow the true ratio: same ranking
+    corr, _ = spearmanr(source_weights, true_ratio)
+    assert corr > 0.9
+    # and close values (both normalized to mean 1 over the source samples)
+    true_ratio /= true_ratio.mean()
+    assert np.mean((source_weights - true_ratio) ** 2) < 0.5
+
+
+def test_uLSIFReweight_improves_target_accuracy():
+    rng = check_random_state(0)
+    n_samples = 400
+    # covariate shift: the source is concentrated on x[0] < 0 and the target
+    # on x[0] > 0, while the labeling function sign(x[0]) is shared
+    X_source = rng.normal([-2.5, 0.0], 1.0, size=(n_samples, 2))
+    X_target = rng.normal([2.5, 0.0], 1.0, size=(n_samples, 2))
+    y_source = (X_source[:, 0] > 0).astype(int)
+    y_target = (X_target[:, 0] > 0).astype(int)
+
+    # without adaptation, the source classifier is biased towards the
+    # majority class of the source domain
+    estimator = LogisticRegression().fit(X_source, y_source)
+    score_unweighted = estimator.score(X_target, y_target)
+    assert score_unweighted < 0.9
+
+    X = np.concatenate([X_source, X_target])
+    # target labels are masked, as they are not available at fit time
+    y = np.concatenate([y_source, -np.ones(n_samples, dtype=int)])
+    sample_domain = np.concatenate([np.ones(n_samples), -np.ones(n_samples)])
+
+    estimator = uLSIFReweight(random_state=0)
+    estimator.fit(X, y, sample_domain=sample_domain)
+    score_reweighted = estimator.score(
+        X_target, y_target, sample_domain=-np.ones(n_samples)
+    )
+    assert score_reweighted > score_unweighted
+    assert score_reweighted > 0.9
+
+
+def test_uLSIFReweight_densratio_cross_check():
+    # optional parity cross-check against the MIT-licensed densratio package
+    densratio = pytest.importorskip("densratio")
+    rng = check_random_state(42)
+    n_samples = 300
+    X_source = rng.normal(np.zeros(2), 1.0, size=(n_samples, 2))
+    X_target = rng.normal(np.array([1.0, 0.0]), 1.0, size=(n_samples, 2))
+
+    X = np.concatenate([X_source, X_target])
+    sample_domain = np.concatenate([np.ones(n_samples), -np.ones(n_samples)])
+
+    estimator = uLSIFReweightAdapter(random_state=0)
+    estimator.fit(X, sample_domain=sample_domain)
+    weights = estimator.compute_weights(X, sample_domain=sample_domain)[:n_samples]
+
+    # densratio(x, y) estimates p_x / p_y, so the target comes first
+    result = densratio(X_target, X_source)
+    ref_weights = result.compute_density_ratio(X_source)
+
+    corr, _ = spearmanr(weights, ref_weights)
+    assert corr > 0.8
 
 
 # KMMReweight.adapt behavior should be the same when smooth weights is True or
