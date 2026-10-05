@@ -1199,6 +1199,280 @@ def KMMReweight(
     )
 
 
+class uLSIFReweightAdapter(BaseReweightAdapter):
+    """Unconstrained Least-Squares Importance Fitting (uLSIF).
+
+    The idea of uLSIF is to find an importance estimate w(x) as a linear
+    combination of Gaussian basis functions centered on target samples,
+    w(x) = sum_l alpha_l * phi_l(x), by directly minimizing the squared
+    error to the density ratio p_target(x) / p_source(x). The solution is
+    given in closed form by alpha = (H_hat + lambda * I)^{-1} h_hat, with
+    H_hat estimated on the source data and h_hat on the target data.
+
+    See [25]_ for details. This method was requested in issue #306.
+
+    Parameters
+    ----------
+    gamma : float, str or array like, default=(0.1, 1.0, 10.0, "scale")
+        Parameters for the Gaussian basis functions, as
+        ``gamma = 1 / (2 * sigma ** 2)`` where sigma is the Gaussian width.
+        If array like, compute the least-squares cross validation to choose
+        the best parameters for the basis functions.
+        If float, solve the least-squares problem for the given parameter.
+        The strings 'auto' and 'scale' are interpreted as in
+        :class:`~sklearn.svm.SVC`.
+    reg : float or array like, default=(0.01, 0.1, 1.0)
+        Regularization parameter lambda of the least-squares problem.
+        If array like, compute the least-squares cross validation to choose
+        the best regularization parameter.
+        If float, solve the least-squares problem for the given parameter.
+    cv : int, cross-validation generator or an iterable, default=5
+        Determines the cross-validation splitting strategy.
+        If it is an int it is the number of folds for the cross validation.
+    n_centers : int, default=100
+        Number of target samples defining the number of basis functions.
+    random_state : int, RandomState instance or None, default=None
+        Determines random number generation for the choice of the centers.
+        Pass an int for reproducible output across multiple function calls.
+
+    Attributes
+    ----------
+    `best_gamma_` : float
+        The gamma parameter for the basis functions, either given as input or
+        chosen with the least-squares cross validation if several parameters
+        are given as input.
+    `best_reg_` : float
+        The regularization parameter, either given as input or chosen with
+        the least-squares cross validation if several parameters are given
+        as input.
+    `alpha_` : array-like, shape (n_centers,)
+        Solution of the least-squares problem.
+    `centers_` : array-like, shape (n_centers, n_features)
+        Target data taken as centers for the basis functions.
+
+    Notes
+    -----
+    The hyperparameters are selected with the cross validation score derived
+    in [25]_ for the least-squares solution: on a validation split, it is
+    given, up to a constant, by
+    ``0.5 * mean(w(x_source) ** 2) - mean(w(x_target))``, where ``w`` is the
+    estimated importance (non-negative coefficients, normalized so that the
+    source weights have mean 1). It is evaluated with a k-fold cross
+    validation scheme, each fold being a closed-form linear solve. The
+    relative variant RuLSIF is not implemented.
+
+    References
+    ----------
+    .. [25] Takafumi Kanamori, Shohei Hido and Masashi Sugiyama.
+            'A Least-squares Approach to Direct Importance Estimation.'
+            In Journal of Machine Learning Research, 10:1391-1445, 2009.
+    """
+
+    def __init__(
+        self,
+        gamma=(0.1, 1.0, 10.0, "scale"),
+        reg=(0.01, 0.1, 1.0),
+        cv=5,
+        n_centers=100,
+        random_state=None,
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.reg = reg
+        self.cv = cv
+        self.n_centers = n_centers
+        self.random_state = random_state
+
+    def fit(self, X, y=None, sample_domain=None, **kwargs):
+        """Fit adaptation parameters.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            The source data.
+        y : array-like, shape (n_samples,)
+            The source labels.
+        sample_domain : array-like, shape (n_samples,)
+            The domain labels (same as sample_domain).
+
+        Returns
+        -------
+        self : object
+            Returns self.
+        """
+        X, sample_domain = check_X_domain(
+            X, sample_domain, allow_multi_source=True, allow_multi_target=True
+        )
+        X_source, X_target = source_target_split(X, sample_domain=sample_domain)
+
+        gammas = self.gamma if isinstance(self.gamma, (list, tuple)) else [self.gamma]
+        gammas = [self._auto_scale_gamma(gamma, X) for gamma in gammas]
+        regs = self.reg if isinstance(self.reg, (list, tuple)) else [self.reg]
+        if np.any(np.asarray(regs, dtype=float) <= 0):
+            raise ValueError(
+                "`reg` argument should be positive, got '%s'" % (self.reg,)
+            )
+
+        if len(gammas) > 1 or len(regs) > 1:
+            self.best_gamma_, self.best_reg_ = self._least_squares_cross_validation(
+                gammas, regs, X_source, X_target
+            )
+        else:
+            self.best_gamma_, self.best_reg_ = gammas[0], regs[0]
+        self.alpha_, self.centers_ = self._weights_optimization(
+            self.best_gamma_, self.best_reg_, X_source, X_target
+        )
+        return self
+
+    def _weights_optimization(self, gamma, reg, X_source, X_target):
+        """Solve the least-squares problem in closed form."""
+        rng = check_random_state(self.random_state)
+        n_targets = len(X_target)
+        n_centers = np.min((n_targets, self.n_centers))
+
+        centers = X_target[rng.choice(np.arange(n_targets), n_centers, replace=False)]
+        A_source = pairwise_kernels(X_source, centers, metric="rbf", gamma=gamma)
+        A_target = pairwise_kernels(X_target, centers, metric="rbf", gamma=gamma)
+
+        H_hat = A_source.T @ A_source / len(X_source)
+        h_hat = A_target.mean(axis=0)
+
+        alpha = np.linalg.solve(H_hat + reg * np.eye(n_centers), h_hat)
+        # project the solution onto the non-negativity constraint
+        alpha = np.maximum(alpha, 0)
+        # normalize the source weights to have mean 1, as the importance
+        # w = p_target / p_source has expectation 1 under the source density
+        mean_source_weights = (A_source @ alpha).mean()
+        if mean_source_weights > 0:
+            alpha /= mean_source_weights
+        else:
+            warnings.warn("All weights are zero after clipping the coefficients.")
+        return alpha, centers
+
+    def _least_squares_cross_validation(self, gammas, regs, X_source, X_target):
+        """Compute the least-squares cross validation score.
+
+        Used to choose the best parameters for the basis functions and the
+        regularization. The score is the one derived in [25] for the
+        least-squares solution, evaluated on held-out samples.
+        """
+        scores = {}
+        cv = check_cv(self.cv)
+        for this_gamma in gammas:
+            for this_reg in regs:
+                this_scores = []
+                for (train_source, test_source), (train_target, test_target) in zip(
+                    cv.split(X_source), cv.split(X_target)
+                ):
+                    alpha, centers = self._weights_optimization(
+                        this_gamma,
+                        this_reg,
+                        X_source[train_source],
+                        X_target[train_target],
+                    )
+                    weights_source = pairwise_kernels(
+                        X_source[test_source], centers, metric="rbf", gamma=this_gamma
+                    ) @ alpha
+                    weights_target = pairwise_kernels(
+                        X_target[test_target], centers, metric="rbf", gamma=this_gamma
+                    ) @ alpha
+                    this_scores.append(
+                        0.5 * np.mean(weights_source**2) - np.mean(weights_target)
+                    )
+                scores[(this_gamma, this_reg)] = np.mean(this_scores)
+        best_gamma_, best_reg_ = min(scores, key=scores.get)
+
+        return best_gamma_, best_reg_
+
+    def compute_weights(self, X, y=None, *, sample_domain=None, **params):
+        check_is_fitted(self)
+        X, sample_domain = check_X_domain(X, sample_domain, allow_source=True)
+        source_idx = extract_source_indices(sample_domain)
+        (source_idx,) = np.where(source_idx)
+        A = pairwise_kernels(
+            X[source_idx], self.centers_, metric="rbf", gamma=self.best_gamma_
+        )
+        source_weights = A @ self.alpha_
+        weights = np.zeros(X.shape[0], dtype=source_weights.dtype)
+        weights[source_idx] = source_weights
+        return weights
+
+    def _auto_scale_gamma(self, gamma, X):
+        if isinstance(gamma, str):
+            # Code snippet from sklearn SVC
+            if gamma == "scale":
+                # var = E[X^2] - E[X]^2 if sparse
+                sparse = sp.issparse(X)
+                X_var = (X.multiply(X)).mean() - (X.mean()) ** 2 if sparse else X.var()
+                gamma = 1.0 / (X.shape[1] * X_var) if X_var != 0 else 1.0
+            elif gamma == "auto":
+                gamma = 1 / X.shape[1]
+        return gamma
+
+
+def uLSIFReweight(
+    base_estimator=None,
+    gamma=(0.1, 1.0, 10.0, "scale"),
+    reg=(0.01, 0.1, 1.0),
+    cv=5,
+    n_centers=100,
+    random_state=None,
+):
+    """uLSIF re-weighting pipeline adapter and estimator.
+
+    see [25]_ for details.
+
+    Parameters
+    ----------
+    base_estimator : sklearn estimator, default=LogisticRegression()
+        estimator used for fitting and prediction
+    gamma : float, str or array like, default=(0.1, 1.0, 10.0, "scale")
+        Parameters for the Gaussian basis functions, as
+        ``gamma = 1 / (2 * sigma ** 2)`` where sigma is the Gaussian width.
+        If array like, compute the least-squares cross validation to choose
+        the best parameters for the basis functions.
+        If float, solve the least-squares problem for the given parameter.
+        The strings 'auto' and 'scale' are interpreted as in
+        :class:`~sklearn.svm.SVC`.
+    reg : float or array like, default=(0.01, 0.1, 1.0)
+        Regularization parameter lambda of the least-squares problem.
+        If array like, compute the least-squares cross validation to choose
+        the best regularization parameter.
+        If float, solve the least-squares problem for the given parameter.
+    cv : int, cross-validation generator or an iterable, default=5
+        Determines the cross-validation splitting strategy.
+        If it is an int it is the number of folds for the cross validation.
+    n_centers : int, default=100
+        Number of target samples defining the number of basis functions.
+    random_state : int, RandomState instance or None, default=None
+        Determines random number generation for the choice of the centers.
+        Pass an int for reproducible output across multiple function calls.
+
+    Returns
+    -------
+    pipeline : sklearn pipeline
+        Pipeline containing the uLSIFReweight adapter and the base estimator.
+
+    References
+    ----------
+    .. [25] Takafumi Kanamori, Shohei Hido and Masashi Sugiyama.
+            'A Least-squares Approach to Direct Importance Estimation.'
+            In Journal of Machine Learning Research, 10:1391-1445, 2009.
+    """
+    if base_estimator is None:
+        base_estimator = LogisticRegression().set_fit_request(sample_weight=True)
+    return make_da_pipeline(
+        uLSIFReweightAdapter(
+            gamma=gamma,
+            reg=reg,
+            cv=cv,
+            n_centers=n_centers,
+            random_state=random_state,
+        ),
+        base_estimator,
+    )
+
+
 class MMDTarSReweightAdapter(BaseReweightAdapter):
     """Target shift reweighting using MMD.
 
